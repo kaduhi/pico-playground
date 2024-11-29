@@ -9,10 +9,19 @@
 #include "pico/stdlib.h"
 #include "pico/usb_device.h"
 #include "pico/audio.h"
+#if USE_AUDIO_I2S
 #include "pico/audio_i2s.h"
+#elif USE_AUDIO_FM_TRANSMITTER
+#include "pico/audio_fm_transmitter.h"
+#include "hardware/pll.h"
+#endif
 #include "pico/multicore.h"
 #include "hardware/clocks.h"
 #include "lufa/AudioClassCommon.h"
+
+#if USE_AUDIO_FM_TRANSMITTER
+#define FM_TRANSMITTER_TX_FREQ_BASE 87900000    // 87.9MHz
+#endif
 
 // todo forget why this is using core 1 for sound: presumably not necessary
 // todo noop when muted
@@ -256,6 +265,11 @@ static struct {
 
 static struct audio_buffer_pool *producer_pool;
 
+#if USE_AUDIO_FM_TRANSMITTER
+// hack
+extern int16_t *g_curr_sample;
+#endif
+
 static void _as_audio_packet(struct usb_endpoint *ep) {
     assert(ep->current_transfer);
     struct usb_buffer *usb_buffer = usb_current_out_packet_buffer(ep);
@@ -264,15 +278,29 @@ static void _as_audio_packet(struct usb_endpoint *ep) {
     struct audio_buffer *audio_buffer = take_audio_buffer(producer_pool, true);
     DEBUG_PINS_CLR(audio_timing, 1);
     assert(!(usb_buffer->data_len & 3u));
+#if USE_AUDIO_I2S
     audio_buffer->sample_count = usb_buffer->data_len / 4;
+#elif USE_AUDIO_FM_TRANSMITTER
+    audio_buffer->sample_count = usb_buffer->data_len / 8;
+#endif
     assert(audio_buffer->sample_count);
     assert(audio_buffer->max_sample_count >= audio_buffer->sample_count);
     uint16_t vol_mul = audio_state.vol_mul;
     int16_t *out = (int16_t *) audio_buffer->buffer->bytes;
     int16_t *in = (int16_t *) usb_buffer->data;
+#if USE_AUDIO_I2S
     for (int i = 0; i < audio_buffer->sample_count * 2; i++) {
         out[i] = (int16_t) ((in[i] * vol_mul) >> 15u);
     }
+#elif USE_AUDIO_FM_TRANSMITTER
+    for (int i = 0; i < audio_buffer->sample_count; i++) {
+        // *out++ = (int16_t) ((((int32_t)*in++ + (int32_t)*in++) * vol_mul / 2) >> 15u);
+        *out++ = (int16_t) ((((int32_t)*in++ + (int32_t)*in++) * vol_mul) >> 15u);  // let vol_mul to handle the sint16 overflow
+        in += 2;    // only use every other samples, ya, we can do ((int32_t)*in++ + (int32_t)*in++ + (int32_t)*in++ + (int32_t)*in++) / 2 instead
+    }
+    // hack: no easy way to get this pointer in audio_fm_transmitter.c
+    g_curr_sample = (int16_t *)audio_buffer->buffer->bytes;
+#endif
 
     give_audio_buffer(producer_pool, audio_buffer);
     // keep on truckin'
@@ -412,6 +440,11 @@ static struct audio_control_cmd {
     uint8_t len;
 } audio_control_cmd_t;
 
+#if USE_AUDIO_FM_TRANSMITTER
+// hack
+extern uint32_t g_current_sample_freq;
+#endif
+
 static void _audio_reconfigure() {
     switch (audio_state.freq) {
         case 44100:
@@ -422,6 +455,10 @@ static void _audio_reconfigure() {
     }
     // todo hack overwriting const
     ((struct audio_format *) producer_pool->format)->sample_freq = audio_state.freq;
+#if USE_AUDIO_FM_TRANSMITTER
+    // hack
+    g_current_sample_freq = audio_state.freq;
+#endif
 }
 
 static void audio_set_volume(int16_t volume) {
@@ -581,9 +618,11 @@ void usb_sound_card_init() {
     usb_device_start();
 }
 
+#if USE_AUDIO_I2S
 static void core1_worker() {
     audio_i2s_set_enabled(true);
 }
+#endif
 
 int main(void) {
     set_sys_clock_48mhz();
@@ -601,6 +640,7 @@ int main(void) {
         assert(freq <= AUDIO_FREQ_MAX);
     }
 #endif
+#if USE_AUDIO_I2S
     // initialize for 48k we allow changing later
     struct audio_format audio_format_48k = {
             .format = AUDIO_BUFFER_FORMAT_PCM_S16,
@@ -629,10 +669,38 @@ int main(void) {
     }
 
     ok = audio_i2s_connect_extra(producer_pool, false, 2, 96, NULL);
+#elif USE_AUDIO_FM_TRANSMITTER
+    static audio_format_t audio_format = {
+            .format = AUDIO_BUFFER_FORMAT_PCM_S16,
+            .sample_freq = 24000,
+            // .sample_freq = 22058,
+            .channel_count = 1,
+    };
+
+    struct audio_buffer_format producer_format = {
+            .format = &audio_format,
+            .sample_stride = 2
+    };
+
+    producer_pool = audio_new_producer_pool(&producer_format, 8, 48); // todo correct size
+    bool __unused ok;
+
+    const struct audio_format *output_format;
+    output_format = audio_fm_transmitter_setup(&audio_format, -1, &default_mono_channel_config, FM_TRANSMITTER_TX_FREQ_BASE);
+    if (!output_format) {
+        panic("PicoAudio: Unable to open audio device.\n");
+    }
+
+    ok = audio_fm_transmitter_default_connect(producer_pool, false);
+#endif
     assert(ok);
     usb_sound_card_init();
 
+#if USE_AUDIO_I2S
     multicore_launch_core1(core1_worker);
+#elif USE_AUDIO_FM_TRANSMITTER
+    audio_fm_transmitter_set_enabled(true);
+#endif
     printf("HAHA %04x %04x %04x %04x\n", MIN_VOLUME, DEFAULT_VOLUME, MAX_VOLUME, VOLUME_RESOLUTION);
     // MSD is irq driven
     while (1) __wfi();
